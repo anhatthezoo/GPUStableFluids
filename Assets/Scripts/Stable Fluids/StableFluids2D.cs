@@ -14,7 +14,12 @@ namespace StableFluids
 
         [Header("Fluid Simulation Parameters")] 
         [SerializeField] private Vector2Int _resolution;
+        [SerializeField] private Vector2Int _volumeSize;
         [SerializeField] private float _diffusion;
+        [SerializeField] private float _vorticity;
+        [SerializeField] private float _groundTemperature;
+        [SerializeField] private float _groundPressure;
+        [SerializeField] private float _lapseRate;
 
         [Header("Testing Parameters")] 
         [SerializeField] private Texture2D _initialImage;
@@ -36,11 +41,16 @@ namespace StableFluids
         private RenderTexture _pressureOutTexture;
         private RenderTexture _pressureInTexture;
         private RenderTexture _divergenceTexture;
+        private RenderTexture _atmosphereLUT;
         
         // Compute kernels
+        private int _updateDisplayKernel;
+        private int _atmoLUTKernel;
+        private int _resetThermoKernel;
         private int _addValueKernel;
         private int _advectionKernel;
-        private int _diffusionKernel;
+        private int _applyForcesKernel;
+        private int _updateThermoKernel;
         private int _projectionPt1Kernel;
         private int _projectionPt2Kernel;
         private int _projectionPt3Kernel;
@@ -49,15 +59,20 @@ namespace StableFluids
 
         // Thread counts
         private Vector3Int _threadCounts;
+        private int _atmoLUTThreads;
         private int _setBoundsXThreadCount;
         private int _setBoundsYThreadCount;
 
         private void Start()
         {
             // Get kernel ids
+            _updateDisplayKernel = _stableFluids2DCompute.FindKernel("UpdateDisplay");
+            _atmoLUTKernel = _stableFluids2DCompute.FindKernel("GenerateAtmoLUT");
+            _resetThermoKernel = _stableFluids2DCompute.FindKernel("ResetThermodynamics");
             _addValueKernel = _stableFluids2DCompute.FindKernel("AddValue");
             _advectionKernel = _stableFluids2DCompute.FindKernel("Advection");
-            _diffusionKernel = _stableFluids2DCompute.FindKernel("Diffusion");
+            _applyForcesKernel = _stableFluids2DCompute.FindKernel("ApplyForces");
+            _updateThermoKernel = _stableFluids2DCompute.FindKernel("UpdateThermodynamics");
             _projectionPt1Kernel = _stableFluids2DCompute.FindKernel("ProjectionPt1");
             _projectionPt2Kernel = _stableFluids2DCompute.FindKernel("ProjectionPt2");
             _projectionPt3Kernel = _stableFluids2DCompute.FindKernel("ProjectionPt3");
@@ -71,6 +86,9 @@ namespace StableFluids
                 Mathf.CeilToInt(_resolution.x / (float)xThreadGroupSize),
                 Mathf.CeilToInt(_resolution.y / (float)yThreadGroupSize),
                 Mathf.CeilToInt(1 / (float)zThreadGroupSize));
+            _stableFluids2DCompute.GetKernelThreadGroupSizes(_atmoLUTKernel,
+                out xThreadGroupSize, out _, out _);
+            _atmoLUTThreads = Mathf.CeilToInt(_resolution.y / (float)xThreadGroupSize);
             _stableFluids2DCompute.GetKernelThreadGroupSizes(_setBoundsXKernel, 
                 out xThreadGroupSize, out yThreadGroupSize, out zThreadGroupSize);
             _setBoundsXThreadCount = Mathf.CeilToInt(_resolution.x * 2 / (float)xThreadGroupSize);
@@ -80,6 +98,11 @@ namespace StableFluids
 
             // Pass constants to compute
             _stableFluids2DCompute.SetInts("_Resolution", new int[] { _resolution.x, _resolution.y });
+            _stableFluids2DCompute.SetFloat("_VolumeHeight", _volumeSize.y);
+            _stableFluids2DCompute.SetFloat("_Vorticity", _vorticity);
+            _stableFluids2DCompute.SetFloat("_GroundTemperature", _groundTemperature);
+            _stableFluids2DCompute.SetFloat("_GroundPressure", _groundPressure);
+            _stableFluids2DCompute.SetFloat("_LapseRate", _lapseRate);
 
             // Subscribe to end of render pipeline event
             RenderPipelineManager.endContextRendering += OnEndContextRendering;
@@ -94,6 +117,7 @@ namespace StableFluids
             _pressureOutTexture = RenderTextureUtilities.AllocateRWLinearRT(_resolution.x, _resolution.y, 0, 1);
             _pressureInTexture = RenderTextureUtilities.AllocateRWLinearRT(_resolution.x, _resolution.y, 0, 1);
             _divergenceTexture = RenderTextureUtilities.AllocateRWLinearRT(_resolution.x, _resolution.y, 0, 1);
+            _atmosphereLUT = RenderTextureUtilities.AllocateRWLinearRT(_resolution.y, 1, 0, 2);
 
             // Reset simulation
             Reset();
@@ -109,7 +133,7 @@ namespace StableFluids
             Vector2 scaledMousePosition = mousePosition / new Vector2(Screen.width, Screen.height) * _resolution;
             if (Input.GetMouseButton(1))
             {
-                Color density = Color.HSVToRGB(Mathf.Repeat(Time.time*0.2f, 1), 0.8f, 0.4f) * _addDensity * Time.deltaTime;
+                Color density = new Color(0.001f, 0.0f, 2.5f, 0.0f) * Time.deltaTime;
                 AddValueToTexture(_densityOutTexture, scaledMousePosition, density, _addDensityRadius);
             }
             if (Input.GetMouseButton(0))
@@ -123,19 +147,50 @@ namespace StableFluids
             }
             _previousMousePosition = mousePosition;
 
+            if (Time.time < 100.0f)
+            {
+                AddValueToTexture(
+                    _densityOutTexture, 
+                    new Vector2(_resolution.x / 2, 1), 
+                    new Color(0.00065f, 0.0f, 0.95f, 0.0f) * Time.deltaTime, 
+                    2.6f);
+
+                AddValueToTexture(
+                    _densityOutTexture, 
+                    new Vector2(_resolution.x / 2 + 3, 1), 
+                    new Color(0.0006f, 0.0f, 0.6f, 0.0f) * Time.deltaTime, 
+                    1.0f);
+
+                AddValueToTexture(
+                    _densityOutTexture, 
+                    new Vector2(_resolution.x / 2 - 5, 1), 
+                    new Color(0.0006f, 0.0f, 0.6f, 0.0f) * Time.deltaTime, 
+                    1.0f);
+
+                AddValueToTexture(
+                    _densityOutTexture, 
+                    new Vector2(_resolution.x / 2 - 32, 1), 
+                    new Color(0.0004f, 0.0f, 0.4f, 0.0f) * Time.deltaTime, 
+                    0.5f);
+
+                AddValueToTexture(
+                    _densityOutTexture, 
+                    new Vector2(_resolution.x / 2 + 48, 1), 
+                    new Color(0.0005f, 0.0f, 0.5f, 0.0f) * Time.deltaTime, 
+                    0.5f); 
+            }
+
             // Update compute parameters
-            float alpha = Time.deltaTime * _diffusion * (_resolution.x - 2) * (_resolution.y - 2);
-            float beta = 1 / (1 + 4 * alpha);
-            _stableFluids2DCompute.SetFloat("_Alpha", alpha);
-            _stableFluids2DCompute.SetFloat("_Beta", beta);
             _stableFluids2DCompute.SetFloat("_DeltaTime", Time.deltaTime);
 
             // Run the fluid simulation
             UpdateVelocity();
             UpdateDensity();
             
-            // Copy density to display
-            Graphics.CopyTexture(_densityOutTexture, _displayTexture);
+            // Update display
+            _stableFluids2DCompute.SetTexture(_updateDisplayKernel, "_DisplayTexture", _displayTexture);
+            _stableFluids2DCompute.SetTexture(_updateDisplayKernel, "_XIn", _densityOutTexture);
+            _stableFluids2DCompute.Dispatch(_updateDisplayKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
         }
 
         /// <summary>
@@ -155,9 +210,14 @@ namespace StableFluids
         /// </summary>
         private void UpdateDensity()
         {
-            Diffuse(_densityInTexture, _densityOutTexture);
             Graphics.CopyTexture(_densityOutTexture, _densityInTexture);  // Swap output to input
             Advect(_densityInTexture, _densityOutTexture);
+
+            Graphics.CopyTexture(_densityOutTexture, _densityInTexture);  // Swap output to input
+            _stableFluids2DCompute.SetTexture(_updateThermoKernel, "_AtmoLUT", _atmosphereLUT);
+            _stableFluids2DCompute.SetTexture(_updateThermoKernel, "_Thermo", _densityInTexture);
+            _stableFluids2DCompute.SetTexture(_updateThermoKernel, "_XOut", _densityOutTexture);
+            _stableFluids2DCompute.Dispatch(_updateThermoKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
         }
         
         /// <summary>
@@ -165,28 +225,17 @@ namespace StableFluids
         /// </summary>
         private void UpdateVelocity()
         {
-            Diffuse(_velocityInTexture, _velocityOutTexture, true);
-            ProjectVelocity();
             Graphics.CopyTexture(_velocityOutTexture, _velocityInTexture); // Swap output to input
             Advect(_velocityInTexture, _velocityOutTexture, true);
-            ProjectVelocity();
-        }
 
-        /// <summary>
-        /// Diffuse input texture using Gauss-Seidel.
-        /// </summary>
-        private void Diffuse(RenderTexture inTexture, RenderTexture outTexture, bool setBounds = false)
-        {
-            for (int k = 0; k < 10; k++)
-            {
-                _stableFluids2DCompute.SetTexture(_diffusionKernel, "_XIn", outTexture);
-                _stableFluids2DCompute.SetTexture(_diffusionKernel, "_XOut", inTexture);
-                _stableFluids2DCompute.Dispatch(_diffusionKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
-                _stableFluids2DCompute.SetTexture(_diffusionKernel, "_XIn", inTexture);
-                _stableFluids2DCompute.SetTexture(_diffusionKernel, "_XOut", outTexture);
-                _stableFluids2DCompute.Dispatch(_diffusionKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
-                if (setBounds) SetBounds(inTexture, outTexture);
-            }
+            Graphics.CopyTexture(_velocityOutTexture, _velocityInTexture); // Swap output to input
+            _stableFluids2DCompute.SetTexture(_applyForcesKernel, "_Velocity", _velocityInTexture);
+            _stableFluids2DCompute.SetTexture(_applyForcesKernel, "_Thermo", _densityOutTexture);
+            _stableFluids2DCompute.SetTexture(_applyForcesKernel, "_AtmoLUT", _atmosphereLUT);
+            _stableFluids2DCompute.SetTexture(_applyForcesKernel, "_XOut", _velocityOutTexture);
+            _stableFluids2DCompute.Dispatch(_applyForcesKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
+
+            ProjectVelocity();
         }
 
         /// <summary>
@@ -218,7 +267,7 @@ namespace StableFluids
             SetBounds(_velocityInTexture, _velocityOutTexture);
             
             // Projection Pt2
-            for (int k = 0; k < 10; k++)
+            for (int k = 0; k < 5; k++)
             {
                 _stableFluids2DCompute.SetTexture(_projectionPt2Kernel, "_Divergence", _divergenceTexture);
                 _stableFluids2DCompute.SetTexture(_projectionPt2Kernel, "_PressureIn", _pressureOutTexture);
@@ -240,7 +289,7 @@ namespace StableFluids
         /// Enforces boundary condition around edges.
         /// </summary>
         private void SetBounds(RenderTexture inTexture, RenderTexture outTexture)
-        { 
+        {
             _stableFluids2DCompute.SetTexture(_setBoundsXKernel, "_XIn", outTexture);
             _stableFluids2DCompute.SetTexture(_setBoundsXKernel, "_XOut", inTexture);
             _stableFluids2DCompute.Dispatch(_setBoundsXKernel, _setBoundsXThreadCount, 1, 1);
@@ -261,6 +310,13 @@ namespace StableFluids
             // Initialize velocity to zero
             Graphics.Blit(Texture2D.blackTexture, _velocityInTexture);
             Graphics.Blit(Texture2D.blackTexture, _velocityOutTexture);
+
+            _stableFluids2DCompute.SetTexture(_atmoLUTKernel, "_AtmoLUT", _atmosphereLUT);
+            _stableFluids2DCompute.Dispatch(_atmoLUTKernel, _atmoLUTThreads, 1, 1);
+
+            _stableFluids2DCompute.SetTexture(_resetThermoKernel, "_AtmoLUT", _atmosphereLUT);
+            _stableFluids2DCompute.SetTexture(_resetThermoKernel, "_Thermo", _densityOutTexture);
+            _stableFluids2DCompute.Dispatch(_resetThermoKernel, _threadCounts.x, _threadCounts.y, _threadCounts.z);
         }
 
         /// <summary>

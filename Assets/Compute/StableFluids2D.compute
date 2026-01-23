@@ -1,7 +1,11 @@
 // Kernels
+#pragma kernel UpdateDisplay
+#pragma kernel GenerateAtmoLUT
+#pragma kernel ResetThermodynamics
 #pragma kernel AddValue
 #pragma kernel Advection
-#pragma kernel Diffusion
+#pragma kernel ApplyForces
+#pragma kernel UpdateThermodynamics;
 #pragma kernel ProjectionPt1
 #pragma kernel ProjectionPt2
 #pragma kernel ProjectionPt3
@@ -12,8 +16,7 @@
 uint2 _Resolution;
 
 // Fluid parameters
-float _Alpha;
-float _Beta;
+float _Vorticity;
 float _DeltaTime;
 
 // Add parameters
@@ -28,7 +31,23 @@ RWTexture2D<float> _PressureIn;
 RWTexture2D<float> _PressureOut;
 RWTexture2D<float> _Divergence;
 RWTexture2D<float2> _Velocity;
+RWTexture2D<float4> _Thermo;
+RWTexture2D<float2> _AtmoLUT;
 RWTexture2D<float4> _DisplayTexture;
+
+#include "./Thermodynamics.hlsl"
+
+uint2 ClampID(uint2 id) {
+	return clamp(id, uint2(0, 0), uint2(_Resolution.x - 1, _Resolution.y - 1));
+}
+
+[numthreads(8, 8, 1)]
+void UpdateDisplay(uint2 id : SV_DispatchThreadID) {
+	if (any(id >= _Resolution))
+		return;
+
+	_DisplayTexture[id] = float4(_XIn[id].y * 1000.0, 0.0, 0.0, 1.0);
+}
 
 ///////////////////////////////////////////////////////////////////////////
 // Add Value
@@ -43,6 +62,27 @@ void AddValue(uint2 id : SV_DispatchThreadID) {
 	float gaussian = exp(-x*x/(2*c*c));
 	
 	_XOut[id] += _AddValue * gaussian;
+}
+
+[numthreads(64, 1, 1)]
+void GenerateAtmoLUT(uint2 id : SV_DispatchThreadID) {
+	if (id.x >= _Resolution.y)
+        return;
+
+	float altitude = getHeightInVolume((float)id.x);
+	float airPressure = getAirPressure(altitude);
+	float localTemp = getAbsoluteTemperature(altitude);
+
+	_AtmoLUT[id.xy] = float2(localTemp, airPressure);
+}
+
+[numthreads(8, 8, 1)]
+void ResetThermodynamics(uint2 id : SV_DispatchThreadID) {
+	if (any(id >= _Resolution))
+		return;
+	
+	float2 thermoState = getAmbientThermoState(id.y);
+	_Thermo[id] = float4(thermoState.x, 0.0, thermoState.y, 0.0);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -71,22 +111,115 @@ void Advection(uint2 id : SV_DispatchThreadID)
 			     st1.y * _XIn[xy1]);
 }
 
-///////////////////////////////////////////////////////////////////////////
-// Diffusion
-///////////////////////////////////////////////////////////////////////////
+float Curl(uint2 id) 
+{
+	return _Velocity[uint2(id.x, id.y + 1)].x - _Velocity[uint2(id.x, id.y - 1)].x +
+		   _Velocity[uint2(id.x - 1, id.y)].y - _Velocity[uint2(id.x + 1, id.y)].y; 
+}
+
 [numthreads(8, 8, 1)]
-void Diffusion(uint2 id : SV_DispatchThreadID)
+void ApplyForces(uint2 id : SV_DispatchThreadID) 
 {
 	if (any(id >= _Resolution))
 		return;
 
-	_XOut[id] =
-		(_XIn[id] + 
-			_Alpha * (_XIn[id + uint2(1, 0)] + 
-					  _XIn[id - uint2(1, 0)] + 
-					  _XIn[id + uint2(0, 1)] + 
-					  _XIn[id - uint2(0, 1)]
-		)) * _Beta;
+	float2 dir; 
+	dir.x = abs(Curl(uint2(id.x, id.y - 1))) - abs(Curl(uint2(id.x, id.y + 1)));
+	dir.y = abs(Curl(uint2(id.x + 1, id.y))) - abs(Curl(uint2(id.x - 1, id.y)));
+
+	dir = dir * (_Vorticity / (length(dir) + 0.00001));
+	float2 vorticityForce = (_DeltaTime * Curl(id) * dir);
+
+	float4 thermo = _Thermo[id];
+    float q_v = thermo.x;
+    float q_c = thermo.y;
+    float theta = thermo.z;
+
+    float2 ambientState = getAmbientThermoState(id.y);
+    float qv_ambient = ambientState.x;
+    float theta_ambient = ambientState.y;
+
+    float theta_v = theta * (1.0 + 0.61 * q_v);
+    float theta_v_ambient = theta_ambient * (1.0 + 0.61 * qv_ambient);
+
+    // --- Improved buoyancy ---
+    float relativeTheta = (theta_v - theta_v_ambient) / max(theta_v_ambient, 1e-4);
+    float buoyancyThreshold = 0.0002;          // tune
+    relativeTheta = max(relativeTheta - buoyancyThreshold, 0.0);
+
+    float buoyancyScale = 0.4;               // tune
+    float buoyancyMax = 3.5;                  // tune
+    float buoyancyForceTemperature = G * buoyancyScale * relativeTheta;
+    buoyancyForceTemperature = min(buoyancyForceTemperature, buoyancyMax);
+
+    float buoyancyForceCondensate = -G * 0.001 * (q_c * 1000.0);
+
+    float height01 = saturate((id.y - 1.0) / 6.0);
+
+    float2 buoyancyForce = float2(0.0, (buoyancyForceTemperature + buoyancyForceCondensate) * height01) * _DeltaTime;
+	buoyancyForce *= 1.0 - 0.001 * _DeltaTime;
+
+	float2 wind = float2(1.0, 0.0) * 0.000001;
+
+    _XOut[id] = float4(_Velocity[id] + vorticityForce + buoyancyForce + wind, 0.0, 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void UpdateThermodynamics(uint2 id : SV_DispatchThreadID)
+{
+	if (any(id >= _Resolution))
+		return;
+
+	float3 thermo = _Thermo[id].xyz;
+	float q_v = thermo.x;
+	float q_c = thermo.y;
+	float theta = thermo.z;
+
+	float airPressure = _AtmoLUT[uint2(id.y, 0)].y;
+	float pi = exner(airPressure);
+	float localTemp = theta * pi;
+	float q_vs = getSaturationMixingRatio(localTemp, airPressure);
+
+	float supersat = q_v - q_vs;
+	float oversat = supersat - q_c;
+	float condensation;
+
+	if (oversat < 0.0) {
+		condensation = oversat * 0.2;
+	} else {
+		condensation = oversat * 0.002;
+	}
+
+	condensation = max(condensation, -q_c);
+	float new_qv = q_v - condensation;
+	float new_qc = q_c + condensation;
+	float new_theta = theta + condensation * (L/(C_P * pi));
+
+    // --- Cloud water loss (precipitation/fallout) ---
+    float precipRate = 0.000001;  // Fraction of cloud water that falls out per step
+    float precipLoss = new_qc * precipRate;
+    new_qc -= precipLoss;
+
+    // --- Subsaturated evaporation boost ---
+    // When air is subsaturated and there's cloud, evaporate cloud faster
+    if (new_qc > 0.0 && q_v < q_vs) {
+        float subsatRatio = (q_vs - q_v) / max(q_vs, 1e-6);
+        float evapBoost = new_qc * subsatRatio * 0.05;
+        evapBoost = min(evapBoost, new_qc);
+        new_qc -= evapBoost;
+        new_qv += evapBoost;
+    }
+
+    // --- Relaxation toward ambient state ---
+    float2 ambientState = getAmbientThermoState(id.y);
+    float qv_ambient = ambientState.x;
+    float theta_ambient = ambientState.y;
+    
+    float relaxRate = 0.00015;  // Gentle relaxation
+    new_qv = lerp(new_qv, qv_ambient, relaxRate);
+    new_theta = lerp(new_theta, theta_ambient, relaxRate);
+
+	_XOut[id] = float4(new_qv, new_qc, new_theta, 0.0);
 }
 
 ///////////////////////////////////////////////////////////////////////////

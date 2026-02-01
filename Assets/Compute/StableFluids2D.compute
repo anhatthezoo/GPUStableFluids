@@ -5,7 +5,7 @@
 #pragma kernel AddValue
 #pragma kernel Advection
 #pragma kernel ApplyForces
-#pragma kernel UpdateThermodynamics;
+#pragma kernel UpdateThermodynamics
 #pragma kernel ProjectionPt1
 #pragma kernel ProjectionPt2
 #pragma kernel ProjectionPt3
@@ -148,7 +148,7 @@ void ApplyForces(uint2 id : SV_DispatchThreadID)
     relativeTheta = max(relativeTheta - buoyancyThreshold, 0.0);
 
     float buoyancyScale = 0.4;               // tune
-    float buoyancyMax = 3.5;                  // tune
+    float buoyancyMax = 3.0;                  // tune
     float buoyancyForceTemperature = G * buoyancyScale * relativeTheta;
     buoyancyForceTemperature = min(buoyancyForceTemperature, buoyancyMax);
 
@@ -180,44 +180,74 @@ void UpdateThermodynamics(uint2 id : SV_DispatchThreadID)
 	float localTemp = theta * pi;
 	float q_vs = getSaturationMixingRatio(localTemp, airPressure);
 
-	float supersat = q_v - q_vs;
-	float oversat = supersat - q_c;
-	float condensation;
+	float q_total = q_v + q_c;
+	float excessWater = q_total - q_vs;
+	float overSaturation = excessWater - q_c;
 
-	if (oversat < 0.0) {
-		condensation = oversat * 0.2;
+	float condensation;
+	if (overSaturation < 0.0) {
+		condensation = overSaturation * 0.20;
 	} else {
-		condensation = oversat * 0.002;
+		condensation = overSaturation * 0.002;
 	}
 
 	condensation = max(condensation, -q_c);
+
 	float new_qv = q_v - condensation;
 	float new_qc = q_c + condensation;
-	float new_theta = theta + condensation * (L/(C_P * pi));
+	float new_theta = theta + condensation * (L / (C_P * pi));
 
-    // --- Cloud water loss (precipitation/fallout) ---
-    float precipRate = 0.000001;  // Fraction of cloud water that falls out per step
-    float precipLoss = new_qc * precipRate;
-    new_qc -= precipLoss;
+	float localTemp_c = KtoC(localTemp);
+	float precipThreshold;
+	if (localTemp_c > 0.0) {
+		precipThreshold = 0.001;
+	} else {
+		precipThreshold = lerp(0.0005, 0.0001, saturate(-localTemp_c / 30.0));
+	}
 
-    // --- Subsaturated evaporation boost ---
-    // When air is subsaturated and there's cloud, evaporate cloud faster
-    if (new_qc > 0.0 && q_v < q_vs) {
-        float subsatRatio = (q_vs - q_v) / max(q_vs, 1e-6);
-        float evapBoost = new_qc * subsatRatio * 0.05;
-        evapBoost = min(evapBoost, new_qc);
-        new_qc -= evapBoost;
-        new_qv += evapBoost;
-    }
+	float precipRate = 0.0;
+	if (new_qc > precipThreshold) {
+		float baseRate = 0.00001;
 
-    // --- Relaxation toward ambient state ---
-    float2 ambientState = getAmbientThermoState(id.y);
-    float qv_ambient = ambientState.x;
-    float theta_ambient = ambientState.y;
-    
-    float relaxRate = 0.00015;  // Gentle relaxation
-    new_qv = lerp(new_qv, qv_ambient, relaxRate);
-    new_theta = lerp(new_theta, theta_ambient, relaxRate);
+		if (localTemp_c < 0.0) {
+			float iceGrowthMult = lerp(1.0, 3.0, saturate(-localTemp_c / 30.0));
+			baseRate *= iceGrowthMult;
+		}
+
+		float excessCloud = new_qc - precipThreshold;
+		precipRate = excessCloud * baseRate;
+	}
+
+	new_qc -= precipRate;
+
+	if (precipRate > 0.0 && new_qv < q_vs) {
+		float subsaturation = q_vs - new_qv;
+		float evapFraction = 0.3; 
+		float precipEvap = min(precipRate * evapFraction, subsaturation);
+
+		new_qv += precipEvap;
+		new_theta -= precipEvap * (L / (C_P * pi));
+		precipRate -= precipEvap;
+	}
+
+	if (localTemp_c < 0.0 && new_qc > 0.0) {
+		float freezingRate = min(new_qc * 0.0001, new_qc);
+		new_theta += freezingRate * (334000.0 / (C_P * pi));
+	} else if (localTemp_c > 0.0 && localTemp_c < 2.0) {
+		float meltingCooling = precipRate * 0.5 * (334000.0 / (C_P * pi));
+		new_theta -= meltingCooling;
+	}
+
+	float2 ambientState = getAmbientThermoState(id.y);
+	float qv_ambient = ambientState.x;
+	float theta_ambient = ambientState.y;
+	
+	float relaxRate = 0.0001;
+	new_qv = lerp(new_qv, qv_ambient, relaxRate);
+	new_theta = lerp(new_theta, theta_ambient, relaxRate);
+
+	new_qv = max(new_qv, 0.0);
+	new_qc = max(new_qc, 0.0);
 
 	_XOut[id] = float4(new_qv, new_qc, new_theta, 0.0);
 }

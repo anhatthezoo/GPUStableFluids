@@ -290,7 +290,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   _stableFluids2DCompute: {fileID: 7200000, guid: 68741bf9dd7fa4400b4c34bdceab0ef6,
     type: 3}
-  _resolution: {x: 128, y: 128}
+  _resolution: {x: 256, y: 256}
   _volumeSize: {x: 4096, y: 8192}
   _diffusion: 0.0000001
   _vorticity: 1.5

@@ -152,32 +152,20 @@ namespace StableFluids
                 AddValueToTexture(
                     _densityOutTexture, 
                     new Vector2(_resolution.x / 2, 1), 
-                    new Color(0.00065f, 0.0f, 0.95f, 0.0f) * Time.deltaTime, 
-                    2.6f);
+                    new Color(0.00065f, 0.0f, 0.8f, 0.0f) * Time.deltaTime, 
+                    3.0f);
 
                 AddValueToTexture(
                     _densityOutTexture, 
-                    new Vector2(_resolution.x / 2 + 3, 1), 
-                    new Color(0.0006f, 0.0f, 0.6f, 0.0f) * Time.deltaTime, 
-                    1.0f);
+                    new Vector2(_resolution.x / 2 - 64, 1), 
+                    new Color(0.00055f, 0.0f, 0.6f, 0.0f) * Time.deltaTime, 
+                    3.5f);
 
                 AddValueToTexture(
                     _densityOutTexture, 
-                    new Vector2(_resolution.x / 2 - 5, 1), 
-                    new Color(0.0006f, 0.0f, 0.6f, 0.0f) * Time.deltaTime, 
-                    1.0f);
-
-                AddValueToTexture(
-                    _densityOutTexture, 
-                    new Vector2(_resolution.x / 2 - 32, 1), 
-                    new Color(0.0004f, 0.0f, 0.4f, 0.0f) * Time.deltaTime, 
-                    0.5f);
-
-                AddValueToTexture(
-                    _densityOutTexture, 
-                    new Vector2(_resolution.x / 2 + 48, 1), 
-                    new Color(0.0005f, 0.0f, 0.5f, 0.0f) * Time.deltaTime, 
-                    0.5f); 
+                    new Vector2(_resolution.x / 2 + 72, 1), 
+                    new Color(0.0005f, 0.0f, 0.65f, 0.0f) * Time.deltaTime, 
+                    3.0f); 
             }
 
             // Update compute parameters

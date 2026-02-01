@@ -1,8 +1,13 @@
 // Kernels
 #pragma kernel Clear
+#pragma kernel UpdateDisplay
+#pragma kernel GenerateAtmoLUT
+#pragma kernel ResetThermodynamics
 #pragma kernel AddValue
+#pragma kernel AddSourcesBatched
 #pragma kernel Advection
-#pragma kernel Diffusion
+#pragma kernel ApplyForces
+#pragma kernel UpdateThermodynamics
 #pragma kernel ProjectionPt1
 #pragma kernel ProjectionPt2
 #pragma kernel ProjectionPt3
@@ -14,14 +19,27 @@
 uint3 _Resolution;
 
 // Fluid parameters
-float _Alpha;
-float _Beta;
+float _Vorticity;
 float _DeltaTime;
 
 // Add parameters
 float _AddRadius;
 float3 _AddPosition;
 float3 _AddValue;
+
+// Batched sources
+struct MoistureSource
+{
+	float3 position;
+	float radius;
+	float3 value;  // moisture, 0, heat
+};
+StructuredBuffer<MoistureSource> _Sources;
+uint _SourceCount;
+
+// Wind parameters
+float3 _WindVelocity;  // Wind velocity in cells/second (X, 0, Z)
+float _WindShearExponent;  // How wind increases with height (power law)
 
 // Buffers
 Texture3D<float3> _XIn;  // Generic input buffer
@@ -30,7 +48,11 @@ RWTexture3D<float> _PressureIn;
 RWTexture3D<float> _PressureOut;
 RWTexture3D<float> _Divergence;
 RWTexture3D<float3> _Velocity;
+RWTexture3D<float4> _Thermo;
+RWTexture2D<float2> _AtmoLUT;
 RWTexture3D<float4> _DisplayTexture;
+
+#include "./Thermodynamics.hlsl"
 
 ///////////////////////////////////////////////////////////////////////////
 // Clear
@@ -43,6 +65,14 @@ void Clear(uint3 id : SV_DispatchThreadID) {
 	_XOut[id] = 0;
 }
 
+[numthreads(4, 4, 4)]
+void UpdateDisplay(uint3 id : SV_DispatchThreadID) {
+	if (any(id >= _Resolution))
+		return;
+
+	_DisplayTexture[id] = float4(_XIn[id].y * 50.0, 0.0, 0.0, 1.0);
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Add Value
 ///////////////////////////////////////////////////////////////////////////
@@ -50,12 +80,54 @@ void Clear(uint3 id : SV_DispatchThreadID) {
 void AddValue(uint3 id : SV_DispatchThreadID) {
 	if (any(id >= _Resolution))
 		return;
-	
+
 	float x = distance(id, _AddPosition);
 	float c = _AddRadius;
 	float gaussian = exp(-x*x/(2*c*c));
-	
+
 	_XOut[id] += _AddValue * gaussian;
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Add Sources Batched - processes all sources in a single dispatch
+///////////////////////////////////////////////////////////////////////////
+[numthreads(4, 4, 4)]
+void AddSourcesBatched(uint3 id : SV_DispatchThreadID) {
+	if (any(id >= _Resolution))
+		return;
+
+	float3 total = 0;
+	for (uint i = 0; i < _SourceCount; i++)
+	{
+		MoistureSource src = _Sources[i];
+		float d = distance((float3)id, src.position);
+		float c = src.radius;
+		float gaussian = exp(-d*d/(2*c*c));
+		total += src.value * gaussian;
+	}
+
+	_XOut[id] += total;
+}
+
+[numthreads(64, 1, 1)]
+void GenerateAtmoLUT(uint3 id : SV_DispatchThreadID) {
+	if (id.x >= _Resolution.y)
+        return;
+
+	float altitude = getHeightInVolume((float)id.x);
+	float airPressure = getAirPressure(altitude);
+	float localTemp = getAbsoluteTemperature(altitude);
+
+	_AtmoLUT[id.xy] = float2(localTemp, airPressure);
+}
+
+[numthreads(4, 4, 4)]
+void ResetThermodynamics(uint3 id : SV_DispatchThreadID) {
+	if (any(id >= _Resolution))
+		return;
+	
+	float2 thermoState = getAmbientThermoState(id.y);
+	_Thermo[id] = float4(thermoState.x, 0.0, thermoState.y, 0.0);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -88,23 +160,166 @@ void Advection(uint3 id : SV_DispatchThreadID)
 							stu1.z * _XIn[xyz1])));
 }
 
-///////////////////////////////////////////////////////////////////////////
-// Diffusion
-///////////////////////////////////////////////////////////////////////////
+float3 CurlVector(uint3 id)
+{
+	float3 c;
+	c.x = _Velocity[uint3(id.x, id.y + 1, id.z)].z - _Velocity[uint3(id.x, id.y - 1, id.z)].z
+		- _Velocity[uint3(id.x, id.y, id.z + 1)].y + _Velocity[uint3(id.x, id.y, id.z - 1)].y;
+
+	c.y = _Velocity[uint3(id.x, id.y, id.z + 1)].x - _Velocity[uint3(id.x, id.y, id.z - 1)].x
+		- _Velocity[uint3(id.x + 1, id.y, id.z)].z + _Velocity[uint3(id.x - 1, id.y, id.z)].z;
+
+	c.z = _Velocity[uint3(id.x + 1, id.y, id.z)].y - _Velocity[uint3(id.x - 1, id.y, id.z)].y
+		- _Velocity[uint3(id.x, id.y + 1, id.z)].x + _Velocity[uint3(id.x, id.y - 1, id.z)].x;
+
+	return c;
+}
+
 [numthreads(4, 4, 4)]
-void Diffusion(uint3 id : SV_DispatchThreadID)
+void ApplyForces(uint3 id : SV_DispatchThreadID)
 {
 	if (any(id >= _Resolution))
 		return;
 
-	_XOut[id] =
-		(_XIn[id] + 
-			_Alpha * (_XIn[id + uint3(1, 0, 0)] + 
-					  _XIn[id - uint3(1, 0, 0)] + 
-					  _XIn[id + uint3(0, 1, 0)] + 
-					  _XIn[id - uint3(0, 1, 0)] +
-					  _XIn[id + uint3(0, 0, 1)] + 
-					  _XIn[id - uint3(0, 0, 1)])) * _Beta;
+	// Compute curl vector and gradient of curl magnitude for vorticity confinement
+	float3 curl = CurlVector(id);
+	float3 curlGrad;
+	curlGrad.x = length(CurlVector(id + uint3(1, 0, 0))) - length(CurlVector(id - uint3(1, 0, 0)));
+	curlGrad.y = length(CurlVector(id + uint3(0, 1, 0))) - length(CurlVector(id - uint3(0, 1, 0)));
+	curlGrad.z = length(CurlVector(id + uint3(0, 0, 1))) - length(CurlVector(id - uint3(0, 0, 1)));
+
+	// Normalized gradient direction
+	float3 N = curlGrad / (length(curlGrad) + 0.00001);
+	// Vorticity force via cross product, scaled by curl magnitude for stronger effect (matching 2D behavior)
+	float curlMag = length(curl);
+	float3 vorticityForce = _Vorticity * _DeltaTime * cross(N, curl) * (1.0 + curlMag);
+
+	float4 thermo = _Thermo[id];
+    float q_v = thermo.x;
+    float q_c = thermo.y;
+    float theta = thermo.z;
+
+    float2 ambientState = getAmbientThermoState(id.y);
+    float qv_ambient = ambientState.x;
+    float theta_ambient = ambientState.y;
+
+    float theta_v = theta * (1.0 + 0.61 * q_v);
+    float theta_v_ambient = theta_ambient * (1.0 + 0.61 * qv_ambient);
+
+	float relativeTheta = (theta_v - theta_v_ambient) / max(theta_v_ambient, 1e-4);
+	float buoyancyThreshold = 0.0002;
+	relativeTheta = max(relativeTheta - buoyancyThreshold, 0.0);
+
+	float buoyancyScale = 0.4;
+	float buoyancyMax = 3.0;
+	float buoyancyForceTemperature = G * buoyancyScale * relativeTheta;
+	buoyancyForceTemperature = min(buoyancyForceTemperature, buoyancyMax);
+
+	float buoyancyForceCondensate = -G * 0.001 * (q_c * 1000.0);
+
+	float height01 = saturate((id.y - 1.0) / 6.0);
+
+    float buoyancyForce = (buoyancyForceTemperature + buoyancyForceCondensate) * height01 * _DeltaTime;
+    buoyancyForce *= 1.0 - 0.001 * _DeltaTime;
+
+	// Wind with height-dependent shear (power law profile)
+	// Applied as gentle nudge toward target wind velocity, not raw acceleration
+	float heightFactor = saturate((float)id.y / (float)_Resolution.y);
+	float shearFactor = pow(heightFactor, _WindShearExponent);
+	float3 targetWind = _WindVelocity * shearFactor;
+	float3 currentHorizontalVel = float3(_Velocity[id].x, 0, _Velocity[id].z);
+	float3 windDiff = targetWind - currentHorizontalVel;
+	float3 wind = windDiff * 0.01 * _DeltaTime;  // Relaxation toward target wind
+
+    _XOut[id] = _Velocity[id] + vorticityForce + float3(0.0, buoyancyForce, 0.0) + wind;
+}
+
+[numthreads(4, 4, 4)]
+void UpdateThermodynamics(uint3 id : SV_DispatchThreadID)
+{
+	if (any(id >= _Resolution))
+		return;
+
+	float3 thermo = _Thermo[id].xyz;
+	float q_v = thermo.x;
+	float q_c = thermo.y;
+	float theta = thermo.z;
+
+	float airPressure = _AtmoLUT[uint2(id.y, 0)].y;
+	float pi = exner(airPressure);
+	float localTemp = theta * pi;
+	float q_vs = getSaturationMixingRatio(localTemp, airPressure);
+
+	float q_total = q_v + q_c;
+	float excessWater = q_total - q_vs;
+	float overSaturation = excessWater - q_c;
+
+	float condensation;
+	if (overSaturation < 0.0) {
+		condensation = overSaturation * 0.25;
+	} else {
+		condensation = overSaturation * 0.005;
+	}
+
+	condensation = max(condensation, -q_c);
+
+	float new_qv = q_v - condensation;
+	float new_qc = q_c + condensation;
+	float new_theta = theta + condensation * (L / (C_P * pi));
+
+	float localTemp_c = KtoC(localTemp);
+	float precipThreshold;
+	if (localTemp_c > 0.0) {
+		precipThreshold = 0.001;
+	} else {
+		precipThreshold = lerp(0.0005, 0.0001, saturate(-localTemp_c / 30.0));
+	}
+
+	float precipRate = 0.0;
+	if (new_qc > precipThreshold) {
+		float baseRate = 0.0001;  // 10x faster precipitation
+
+		if (localTemp_c < 0.0) {
+			float iceGrowthMult = lerp(1.0, 3.0, saturate(-localTemp_c / 30.0));
+			baseRate *= iceGrowthMult;
+		}
+
+		float excessCloud = new_qc - precipThreshold;
+		precipRate = excessCloud * baseRate;
+	}
+
+	new_qc -= precipRate;
+
+	if (precipRate > 0.0 && new_qv < q_vs) {
+		float subsaturation = q_vs - new_qv;
+		float evapFraction = 0.3; 
+		float precipEvap = min(precipRate * evapFraction, subsaturation);
+
+		new_qv += precipEvap;
+		new_theta -= precipEvap * (L / (C_P * pi));
+		precipRate -= precipEvap;
+	}
+
+	if (localTemp_c < 0.0 && new_qc > 0.0) {
+		float freezingRate = min(new_qc * 0.0001, new_qc);
+		new_theta += freezingRate * (334000.0 / (C_P * pi));
+	} else if (localTemp_c > 0.0 && localTemp_c < 2.0) {
+		float meltingCooling = precipRate * 0.5 * (334000.0 / (C_P * pi));
+		new_theta -= meltingCooling;
+	}
+
+	float2 ambientState = getAmbientThermoState(id.y);
+	float qv_ambient = ambientState.x;
+	float theta_ambient = ambientState.y;
+	
+	float relaxRate = 0.001;  // 10x faster relaxation for dissipation
+	new_qv = lerp(new_qv, qv_ambient, relaxRate);
+	new_theta = lerp(new_theta, theta_ambient, relaxRate);
+
+	new_qv = max(new_qv, 0.0);
+	new_qc = max(new_qc, 0.0);
+
+	_XOut[id] = float4(new_qv, new_qc, new_theta, 0.0);
 }
 
 ///////////////////////////////////////////////////////////////////////////
